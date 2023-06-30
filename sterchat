@@ -1,0 +1,194 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import gradio as gr
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+#import time
+#import os
+from threading import Thread
+
+model_name = "starchat-beta"
+
+print(f"Loading `{model_name}`")
+
+# Select "big model inference" parameters
+torch_dtype = "float16" #@param ["float16", "bfloat16", "float"]
+load_in_8bit = False #@param {type:"boolean"}
+device_map = "auto"
+
+
+tok = AutoTokenizer.from_pretrained(pretrained_model_name_or_path="/data/models/"+model_name)
+m = AutoModelForCausalLM.from_pretrained(
+    pretrained_model_name_or_path="/data/models/"+model_name,
+    torch_dtype=getattr(torch, torch_dtype),
+    load_in_8bit=load_in_8bit,
+    device_map=device_map,
+    offload_folder="./offload",
+).cuda()
+
+generator = pipeline('text-generation', model=m, tokenizer=tok, device=0)
+print(f"Loaded `{model_name}`")
+
+system_token = "<|system|>"
+assistant_token = "<|assistant|>"
+stop_token = "<|end|>"
+end_token = "<|end|>\n" 
+user_token = "<|user|>"
+
+start_message =  system_token+"""Below is a conversation between a human user and a helpful AI assistant."""
+#tok.pad_token = tok.eos_token
+#tok.add_tokens([stop_token])
+max_response = 1024
+
+
+
+class StopOnTokens(StoppingCriteria):
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        #stop_ids = [50278, 50279, 50277, 1, 0]
+        stop_ids = [tok.encode(w)[0] for w in [stop_token]]
+        for stop_id in stop_ids:
+            if input_ids[0][-1] == stop_id:
+                return True
+        return False
+
+
+def user(message, history):
+    # Append the user's message to the conversation history
+    return "", history + [[message, ""]]
+
+
+
+def chat(curr_system_message, history, temperature, repetition_penalty, top_p, top_k, length_penalty, epsilon_cutoff, eta_cutoff):
+    # Initialize a StopOnTokens object
+    stop = StopOnTokens()
+
+    # Construct the input message string for the model by concatenating the current system message and conversation history
+    messages = curr_system_message + end_token + \
+        "".join(["".join([user_token+item[0]+end_token, assistant_token+item[1]])
+                for item in history])
+#    print(messages)
+
+    # Tokenize the messages string
+    model_inputs = tok([messages], return_tensors="pt").to("cuda")
+    streamer = TextIteratorStreamer(
+        tok, timeout=10., skip_prompt=True, skip_special_tokens=True)
+    generate_kwargs = dict(
+        model_inputs,
+        streamer=streamer,
+        max_new_tokens=max_response,
+        do_sample=True,
+        top_p=top_p,
+        top_k=top_k,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        length_penalty=length_penalty,
+        eta_cutoff=eta_cutoff,
+        epsilon_cutoff=epsilon_cutoff,
+        num_beams=1,
+        pad_token_id=tok.eos_token_id,
+        stopping_criteria=StoppingCriteriaList([stop])
+    )
+    t = Thread(target=m.generate, kwargs=generate_kwargs)
+    t.start()
+
+    # print(history)
+    # Initialize an empty string to store the generated text
+    partial_text = ""
+    for new_text in streamer:
+        # print(new_text)
+        partial_text += new_text
+        history[-1][1] = partial_text
+        # Yield an empty string to cleanup the message textbox and the updated conversation history
+        yield history
+    return partial_text
+
+examples = [
+    "How can I write a Python function to generate the nth Fibonacci number?",
+    "How do I get the current date using shell commands? Explain how it works.",
+    "What's the meaning of life?",
+    "What is cloud native application development?",
+    "Write a function in Javascript to reverse words in a given string.",
+    "Give the following data {'Name':['Tom', 'Brad', 'Kyle', 'Jerry'], 'Age':[20, 21, 19, 18], 'Height' : [6.1, 5.9, 6.0, 6.1]}. Can you plot one graph with two subplots as columns. The first is a bar graph showing the height of each person. The second is a bargraph showing the age of each person? Draw the graph in seaborn talk mode.",
+    "Create a regex to extract dates from logs",
+    "How to decode JSON into a typescript object",
+    "Write a list into a jsonlines file and save locally",
+]
+
+
+def process_example(args):
+    for [x, y] in generate(args):
+        pass
+    return [x, y]
+
+
+with gr.Blocks(title="Chatbot ("+model_name+")", css="footer {visibility: hidden}") as demo:
+    # history = gr.State([])
+
+    with gr.Row():
+        with gr.Column(scale=3):
+            with gr.Tab("Basic"):
+                temperature=1.0
+                repetition_penalty=1.0
+                top_p=1.0
+                top_k=50
+                length_penalty=1.0
+                epsilon_cutoff=0.0
+                eta_cutoff=0.0
+                system_msg=start_message
+            with gr.Tab("Advanced"):
+                with gr.Accordion("Parameters", open=False):
+                    temperature = gr.Slider(label="Temperature", minimum=0.0, maximum=5.0, value=1.0, step=0.01, interactive=True)
+                    repetition_penalty = gr.Slider(label="Repetiton Penalty", minimum=0.1, maximum=3.0, value=1.0, step=0.01, interactive=True)
+                    top_p = gr.Slider(label="Top-p", minimum=0.1, maximum=1.0, value=1.0, step=0.01, interactive=True)
+                    top_k = gr.Slider(label="Top-k", minimum=1, maximum=50, value=50, step=1, interactive=True)
+                    length_penalty = gr.Slider(label="Length penalty", minimum=-5.0, maximum=5.0, value=1.0, step=0.01, interactive=True)
+                    epsilon_cutoff = gr.Slider(label="Epsilon cutoff", minimum=0.0, maximum=0.0009, value=0.0, step=0.000001, interactive=True)
+                    eta_cutoff = gr.Slider(label="Eta cutoff", minimum=0.0, maximum=0.002, value=0.0, step=0.000001, interactive=True)
+                    system_msg = gr.Textbox(start_message, label="System Message", interactive=True, visible=True)
+
+        with gr.Column(scale=1):
+            gr.Markdown("""![TESTORG](file/logo.png)""")
+            #gr.HTML("""<p>Logo<img src="logo.png">""")
+ 
+    with gr.Row(): 
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot([], elem_id="chatbot", label="AI Chatbot").style(height=450)
+    
+            with gr.Row():
+                user_message = gr.Textbox(label="Chat Message Box", placeholder="Chat Message Box",
+                                 show_label=False).style(container=False)
+                submit = gr.Button("Send", variant="primary").style(full_width=False)
+
+            with gr.Row():
+                clear = gr.Button("Clear chat")
+                stop = gr.Button("Stop").style(full_width=False)
+        
+        with gr.Column(scale=1):
+            gr.Examples(
+                examples=examples,
+                inputs=[user_message],
+                cache_examples=False,
+                fn=process_example,
+                outputs=[chatbot],
+            )
+    with gr.Row():
+        gr.Markdown(" ⚠️**Disclaimer:** dit is een experimentele chatbot die regelmatig foute antwoorden geeft. Nederlands wordt nog niet ondersteund. \
+                      De chatbot is getraind op 80+ programmeertalen, en kan daarom het beste bij programmeertaken worden gebruikt. \
+                      ")
+
+    
+    system_msg = gr.Textbox(
+         start_message, label="System Message", interactive=False, visible=False)
+
+    submit_event = user_message.submit(fn=user, inputs=[user_message, chatbot], outputs=[user_message, chatbot], queue=False).then(
+         fn=chat, inputs=[system_msg, chatbot, temperature, repetition_penalty, top_p, top_k, length_penalty, epsilon_cutoff, eta_cutoff], outputs=[chatbot], queue=True)
+    submit_click_event = submit.click(fn=user, inputs=[user_message, chatbot], outputs=[user_message, chatbot], queue=False).then(
+            fn=chat, inputs=[system_msg, chatbot, temperature, repetition_penalty, top_p, top_k, length_penalty, epsilon_cutoff, eta_cutoff], outputs=[chatbot], queue=True)
+    stop.click(fn=None, inputs=None, outputs=None, cancels=[
+               submit_event, submit_click_event], queue=False)
+    clear.click(lambda: None, None, [chatbot], queue=False)
+
+
+demo.queue(max_size=32, concurrency_count=2)
+demo.launch(server_name='0.0.0.0')
